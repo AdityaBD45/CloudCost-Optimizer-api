@@ -18,7 +18,7 @@ class WasteDetector:
     def __init__(self,
                  cpu_threshold: float = 20.0,
                  memory_threshold: float = 30.0,
-                 min_idle_hours: int = 1):
+                 min_idle_hours: float = 1.0):  # Changed to float
         """
         cpu_threshold: CPU % below this is considered underutilized
         memory_threshold: Memory % below this is considered underutilized
@@ -68,8 +68,10 @@ class WasteDetector:
         Find continuous periods where CPU and Memory are below thresholds.
         Returns a list of dicts with start, end, duration, avg cpu/mem, wasted_cost.
         """
-
+        
+        # Ensure timestamp is datetime
         df = df.copy()
+        df["timestamp"] = pd.to_datetime(df["timestamp"])
         df["idle"] = (df["cpu_usage"] < self.cpu_threshold) & \
                      (df["memory_usage"] < self.memory_threshold)
 
@@ -96,18 +98,36 @@ class WasteDetector:
 
     def _append_idle_block(self, df: pd.DataFrame, start_idx: int, end_idx: int, idle_periods: list):
         """Helper: build an idle block dict and append if duration meets requirement."""
-        duration = end_idx - start_idx + 1
-
-        if duration < self.min_idle_hours:
-            return
-
         block = df.iloc[start_idx:end_idx + 1]
+        
+        # Calculate actual time duration in hours
+        start_time = pd.to_datetime(block["timestamp"].iloc[0])
+        end_time = pd.to_datetime(block["timestamp"].iloc[-1])
+        
+        # Calculate duration in hours
+        duration_hours = (end_time - start_time).total_seconds() / 3600
+        
+        # Handle edge case: same timestamp (e.g., both 21:00)
+        if duration_hours == 0:
+            # Estimate based on sampling interval
+            if len(df) > 1:
+                # Calculate average interval between samples
+                time_diff = pd.to_datetime(df["timestamp"].iloc[1]) - pd.to_datetime(df["timestamp"].iloc[0])
+                avg_interval_hours = time_diff.total_seconds() / 3600
+                duration_hours = avg_interval_hours
+            else:
+                duration_hours = 1.0  # Default to 1 hour if we can't determine
+        
+        # Check minimum duration
+        if duration_hours < self.min_idle_hours:
+            return
+        
         wasted_cost = float(block["cost_per_hour"].sum())
 
         idle_periods.append({
             "start": str(block["timestamp"].iloc[0]),
             "end": str(block["timestamp"].iloc[-1]),
-            "duration_hours": int(duration),
+            "duration_hours": round(duration_hours, 2),  # FIXED: Use actual hours
             "avg_cpu": round(float(block["cpu_usage"].mean()), 2),
             "avg_memory": round(float(block["memory_usage"].mean()), 2),
             "wasted_cost": round(wasted_cost, 2),
@@ -119,8 +139,18 @@ class WasteDetector:
         """
         Calculate waste metrics.
         """
+        
+        # Ensure timestamp is datetime for duration calculations
+        df = df.copy()
+        df["timestamp"] = pd.to_datetime(df["timestamp"])
+        
+        # Calculate total time span in hours
+        if len(df) > 1:
+            total_hours = (df["timestamp"].iloc[-1] - df["timestamp"].iloc[0]).total_seconds() / 3600
+            total_hours = max(total_hours, 1)  # At least 1 hour
+        else:
+            total_hours = 1.0
 
-        total_hours = len(df)
         if total_hours == 0:
             return {
                 "underutilized_score": 0.0,
@@ -133,6 +163,8 @@ class WasteDetector:
         total_waste_percentage = round(underutilized_score * 100, 2)
 
         observed_wasted_cost = sum(p["wasted_cost"] for p in idle_periods)
+        
+        # Calculate days observed
         days_observed = max((df["timestamp"].max() - df["timestamp"].min()).days + 1, 1)
         factor = 30 / days_observed  # approximate monthly scaling
         estimated_monthly_savings = round(observed_wasted_cost * factor, 2)
@@ -162,9 +194,12 @@ class WasteDetector:
         # 2) Scheduling shutdowns
         if idle_periods:
             longest_idle = max(idle_periods, key=lambda x: x["duration_hours"])
+            # Format timestamps nicely
+            start_time = pd.to_datetime(longest_idle['start']).strftime('%Y-%m-%d %H:%M')
+            end_time = pd.to_datetime(longest_idle['end']).strftime('%Y-%m-%d %H:%M')
             recs.append(
                 f"Schedule automatic shutdown during long idle periods "
-                f"(e.g., from {longest_idle['start']} to {longest_idle['end']})."
+                f"(e.g., from {start_time} to {end_time})."
             )
 
         # 3) Burstable instance
