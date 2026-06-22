@@ -1,23 +1,19 @@
 from fastapi import APIRouter, UploadFile, File, Form,Body
 from typing import Optional
 import pandas as pd
-import pickle
 import json
 from pathlib import Path
 
 from data_preparation.parse_input import parse_csv, parse_json
-
-# Correct model path
-MODEL_PATH = Path(__file__).resolve().parents[2] / "ml" / "cost_predictor.pkl"
+from ml.cost_predictor import CostPredictor
 
 router = APIRouter(
     prefix="/predict-cost",
     tags=["cost_prediction"]
 )
 
-# Load model once globally at startup
-with open(MODEL_PATH, "rb") as f:
-    cost_model = pickle.load(f)
+# Load model once globally at startup (loads the .keras file + scaler.json internally)
+cost_model = CostPredictor()
 
 
 @router.post("")

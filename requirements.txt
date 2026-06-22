@@ -3,5 +3,5 @@ uvicorn
 pandas
 numpy
 scikit-learn
-lightgbm
+tensorflow-cpu
 python-multipart

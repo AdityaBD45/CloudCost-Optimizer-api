@@ -1,162 +1,118 @@
-import warnings
-warnings.filterwarnings("ignore", category=UserWarning)
+"""
+LSTM-based 7-day cost / utilization forecaster.
 
-import pandas as pd
+Replaces the old recursive LightGBM approach entirely:
+  - One forward pass over the last 72 hours of history produces the WHOLE
+    7-day forecast directly (no recursive hour-by-hour loop, so no
+    compounding error).
+  - Cost predictions come with genuine P10/P50/P90 confidence intervals
+    learned by the model - "confidence" below is derived from how tight
+    that interval is, not a hardcoded number.
+"""
+
+import json
+from pathlib import Path
+
 import numpy as np
-from datetime import timedelta
+import pandas as pd
+from tensorflow import keras
 
-from lightgbm import LGBMRegressor
+from ml.lstm_forecaster import (
+    Scaler, add_calendar_features, ALL_FEATURE_COLS, FEATURE_COLS,
+    INPUT_LEN, OUTPUT_LEN, make_pinball_loss,
+)
+
+MODEL_DIR = Path(__file__).resolve().parent
 
 
 class CostPredictor:
     def __init__(self):
-        # Pretrained LightGBM models
-        self.cpu_model = LGBMRegressor()
-        self.mem_model = LGBMRegressor()
-        self.disk_model = LGBMRegressor()
-        self.cost_model = LGBMRegressor()
+        self.model = keras.models.load_model(
+            MODEL_DIR / "lstm_forecaster.keras",
+            custom_objects={"loss_fn": make_pinball_loss()},
+            compile=False,
+        )
 
-        self.feature_cols = [
-            "hour",
-            "day_of_week",
-            "is_weekend",
-            "cpu_prev1",
-            "mem_prev1",
-            "disk_prev1",
-            "cost_prev1",
-            "cost_prev2",
-            "cpu_roll3",
-            "mem_roll3",
-            "disk_roll3",
-        ]
+        with open(MODEL_DIR / "scaler.json") as f:
+            d = json.load(f)
+
+        self.feature_scaler = Scaler()
+        self.feature_scaler.mean = np.array(d["mean"], dtype=np.float32)
+        self.feature_scaler.std = np.array(d["std"], dtype=np.float32)
+
+        self.target_scaler = Scaler()
+        self.target_scaler.mean = np.array(d["target_mean"], dtype=np.float32)
+        self.target_scaler.std = np.array(d["target_std"], dtype=np.float32)
+
+        self.cost_idx = FEATURE_COLS.index("cost_per_hour")
+        self.util_idx = [FEATURE_COLS.index(c) for c in ["cpu_usage", "memory_usage", "disk_usage"]]
 
     # -----------------------------------------------------------
-    # Build feature engineering for user input
+    # Build the model's required 72-hour input window from raw user data
     # -----------------------------------------------------------
-    def _prepare_features(self, df: pd.DataFrame):
+    def _build_input_window(self, df: pd.DataFrame) -> np.ndarray:
         df = df.copy()
         df["timestamp"] = pd.to_datetime(df["timestamp"])
         df = df.sort_values("timestamp").reset_index(drop=True)
 
-        df["hour"] = df["timestamp"].dt.hour
-        df["day_of_week"] = df["timestamp"].dt.dayofweek
-        df["is_weekend"] = df["day_of_week"].isin([5, 6]).astype(int)
+        if len(df) < INPUT_LEN:
+            # Not enough history for a full 72h window - repeat what we have
+            # so the API still returns a forecast instead of erroring out.
+            reps = int(np.ceil(INPUT_LEN / len(df)))
+            df = pd.concat([df] * reps, ignore_index=True).tail(INPUT_LEN).reset_index(drop=True)
+        else:
+            df = df.tail(INPUT_LEN).reset_index(drop=True)
 
-        df["cpu_prev1"] = df["cpu_usage"].shift(1)
-        df["mem_prev1"] = df["memory_usage"].shift(1)
-        df["disk_prev1"] = df["disk_usage"].shift(1)
-        df["cost_prev1"] = df["cost_per_hour"].shift(1)
-        df["cost_prev2"] = df["cost_per_hour"].shift(2)
-
-        df["cpu_roll3"] = df["cpu_usage"].rolling(3).mean()
-        df["mem_roll3"] = df["memory_usage"].rolling(3).mean()
-        df["disk_roll3"] = df["disk_usage"].rolling(3).mean()
-
-        df = df.dropna().reset_index(drop=True)
-        return df
+        df_feat = add_calendar_features(df)
+        feat = df_feat[ALL_FEATURE_COLS].values.astype(np.float32)
+        scaled = self.feature_scaler.transform(feat)
+        return scaled[np.newaxis, :, :]  # add batch dim -> (1, 72, n_features)
 
     # -----------------------------------------------------------
-    # Build next-hour features using history
+    # Predict next 7 days - single forward pass, no recursion
     # -----------------------------------------------------------
-    def _build_feature_row(self, history_df, next_ts):
-        last = history_df.iloc[-1]
-        prev = history_df.iloc[-2] if len(history_df) > 1 else last
+    def predict_next_7_days(self, df: pd.DataFrame):
+        X = self._build_input_window(df)
+        cost_pred, util_pred = self.model.predict(X, verbose=0)
 
-        row = {
-            "hour": next_ts.hour,
-            "day_of_week": next_ts.dayofweek,
-            "is_weekend": int(next_ts.dayofweek in [5, 6]),
+        cost_p10 = self.target_scaler.inverse_transform_col(cost_pred[0, :, 0], self.cost_idx)
+        cost_p50 = self.target_scaler.inverse_transform_col(cost_pred[0, :, 1], self.cost_idx)
+        cost_p90 = self.target_scaler.inverse_transform_col(cost_pred[0, :, 2], self.cost_idx)
 
-            "cpu_prev1": float(last["cpu_usage"]),
-            "mem_prev1": float(last["memory_usage"]),
-            "disk_prev1": float(last["disk_usage"]),
+        cpu = self.target_scaler.inverse_transform_col(util_pred[0, :, 0], self.util_idx[0])
+        mem = self.target_scaler.inverse_transform_col(util_pred[0, :, 1], self.util_idx[1])
 
-            "cost_prev1": float(last["cost_per_hour"]),
-            "cost_prev2": float(prev["cost_per_hour"]),
+        cpu = np.clip(cpu, 0, 100)
+        mem = np.clip(mem, 0, 100)
+        cost_p10 = np.clip(cost_p10, 0, None)
+        cost_p50 = np.clip(cost_p50, 0, None)
+        cost_p90 = np.clip(cost_p90, 0, None)
 
-            "cpu_roll3": float(history_df["cpu_usage"].tail(3).mean()),
-            "mem_roll3": float(history_df["memory_usage"].tail(3).mean()),
-            "disk_roll3": float(history_df["disk_usage"].tail(3).mean()),
-        }
+        last_ts = pd.to_datetime(df["timestamp"]).max()
+        timestamps = [last_ts + pd.Timedelta(hours=h + 1) for h in range(OUTPUT_LEN)]
 
-        return pd.DataFrame([row])[self.feature_cols]
+        hourly = pd.DataFrame({
+            "timestamp": timestamps,
+            "cost_p10": cost_p10, "cost_p50": cost_p50, "cost_p90": cost_p90,
+            "cpu_usage": cpu, "memory_usage": mem,
+        })
+        hourly["date"] = hourly["timestamp"].dt.date
 
-    # -----------------------------------------------------------
-    # Predict next 7 days (production version) - BUG FIXED
-    # -----------------------------------------------------------
-    def predict_next_7_days(self, df):
-        df = df.copy()
-        df["timestamp"] = pd.to_datetime(df["timestamp"])
-        df = df.sort_values("timestamp").reset_index(drop=True)
-
-        df = self._prepare_features(df)
-        history = df[["timestamp", "cpu_usage", "memory_usage", "disk_usage", "cost_per_hour"]].copy()
-
-        hourly_predictions = []
-        last_ts = history["timestamp"].iloc[-1]
-
-        # Small weekend/weekday smoothing - FIXED VERSION
-        baseline = df.copy()
-        baseline["day_of_week"] = baseline["timestamp"].dt.dayofweek
-        weekday_pat = baseline[baseline["day_of_week"] <= 4][["cpu_usage", "memory_usage"]].mean()
-        weekend_pat = baseline[baseline["day_of_week"] >= 5][["cpu_usage", "memory_usage"]].mean()
-        GUIDE = 0.2
-
-        for _ in range(168):  # 7 days * 24 hours
-            next_ts = last_ts + timedelta(hours=1)
-            X = self._build_feature_row(history, next_ts)
-
-            cpu_raw = float(self.cpu_model.predict(X)[0])
-            mem_raw = float(self.mem_model.predict(X)[0])
-            disk_raw = float(self.disk_model.predict(X)[0])
-            cost_raw = float(self.cost_model.predict(X)[0])
-
-            # Light smoothing - FIXED: Weekend uses weekend patterns, Weekday uses weekday patterns
-            if next_ts.dayofweek >= 5:  # Weekend (Sat, Sun)
-                cpu_guide, mem_guide = weekend_pat["cpu_usage"], weekend_pat["memory_usage"]
-            else:  # Weekday (Mon-Fri)
-                cpu_guide, mem_guide = weekday_pat["cpu_usage"], weekday_pat["memory_usage"]
-
-            cpu = (1 - GUIDE) * cpu_raw + GUIDE * cpu_guide
-            mem = (1 - GUIDE) * mem_raw + GUIDE * mem_guide
-            disk = disk_raw
-            cost = cost_raw
-
-            cpu = float(np.clip(cpu, 0, 100))
-            mem = float(np.clip(mem, 0, 100))
-            disk = float(np.clip(disk, 0, 100))
-            cost = float(max(cost, 0))
-
-            new_row = {
-                "timestamp": next_ts,
-                "cpu_usage": cpu,
-                "memory_usage": mem,
-                "disk_usage": disk,
-                "cost_per_hour": cost,
-            }
-            history = pd.concat([history, pd.DataFrame([new_row])], ignore_index=True)
-
-            hourly_predictions.append({
-                "timestamp": next_ts,
-                "predicted_cost": cost,
-                "cpu_usage": cpu,
-                "memory_usage": mem,
-                "confidence": 0.9,
-            })
-
-            last_ts = next_ts
-
-        pred_df = pd.DataFrame(hourly_predictions)
-        pred_df["date"] = pred_df["timestamp"].dt.date
-
-        daily = pred_df.groupby("date").agg(
-            predicted_cost=("predicted_cost", "sum"),
+        daily = hourly.groupby("date", as_index=False).agg(
+            cost=("cost_p50", "sum"),
+            cost_low=("cost_p10", "sum"),
+            cost_high=("cost_p90", "sum"),
             avg_cpu=("cpu_usage", "mean"),
             avg_memory=("memory_usage", "mean"),
-            avg_confidence=("confidence", "mean"),
-        ).reset_index()
+        )
 
-        trend_strength = round(float(daily["predicted_cost"].pct_change().mean() or 0), 4)
+        # Genuine confidence: derived from how wide the P10-P90 band is
+        # relative to the median forecast. A tight band = high confidence.
+        # This replaces the old hardcoded `confidence: 0.9`.
+        spread = (daily["cost_high"] - daily["cost_low"]) / daily["cost"].clip(lower=1e-6)
+        daily["confidence"] = (1 - spread).clip(0.3, 0.99)
+
+        trend_strength = round(float(daily["cost"].pct_change().mean() or 0), 4)
         if trend_strength > 0.01:
             trend = "increasing"
         elif trend_strength < -0.01:
@@ -169,21 +125,22 @@ class CostPredictor:
             result.append({
                 "date": str(r["date"]),
                 "weekday": pd.to_datetime(r["date"]).strftime("%A"),
-                "cost": round(float(r["predicted_cost"]), 4),
+                "cost": round(float(r["cost"]), 4),
+                "cost_range": [round(float(r["cost_low"]), 4), round(float(r["cost_high"]), 4)],
                 "avg_cpu": round(float(r["avg_cpu"]), 2),
                 "avg_memory": round(float(r["avg_memory"]), 2),
-                "confidence": round(float(r["avg_confidence"]), 2),
+                "confidence": round(float(r["confidence"]), 2),
             })
 
         return {
             "predicted_cost_next_7_days": result,
-            "total_predicted_weekly_cost": round(float(daily["predicted_cost"].sum()), 4),
+            "total_predicted_weekly_cost": round(float(daily["cost"].sum()), 4),
             "trend": trend,
             "trend_strength": trend_strength,
         }
 
     # -----------------------------------------------------------
-    # Predict peak loads
+    # Predict peak loads (based on recent actual history, not a forecast)
     # -----------------------------------------------------------
     def predict_performance(self, df):
         df = df.sort_values("timestamp").reset_index(drop=True)
@@ -213,6 +170,11 @@ class CostPredictor:
 
     # -----------------------------------------------------------
     # Optimization suggestions
+    # NOTE: these remain simple rule-based heuristics (not model outputs) -
+    # e.g. "idle at night -> suggest scheduling". That's intentional: this
+    # part isn't a forecasting problem, just business rules. The confidence
+    # values here are fixed by design, separate from the forecast confidence
+    # above (which IS model-derived).
     # -----------------------------------------------------------
     def optimization_opportunities(self, df, cost_pred):
         df = df.sort_values("timestamp").reset_index(drop=True)
@@ -261,7 +223,7 @@ class CostPredictor:
         return ops
 
     # -----------------------------------------------------------
-    # MAIN ENTRYPOINT (no training)
+    # MAIN ENTRYPOINT
     # -----------------------------------------------------------
     def analyze(self, df):
         df = df.copy()
