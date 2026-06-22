@@ -6,3 +6,5 @@ __pycache__/
 data_preparation/train.csv
 data_preparation/val.csv
 data_preparation/test.csv
+
+.gitignore
